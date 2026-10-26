@@ -1,0 +1,24 @@
+[Unit]
+Description=Server Control MCP executor and OAuth gateway
+After=network.target
+
+[Service]
+Type=simple
+User=mcp
+Group=mcp
+WorkingDirectory=/opt/server-control-mcp
+EnvironmentFile=/etc/server-control-mcp.env
+Environment=SCM_STATE_DIR=/var/lib/server-control-mcp
+Environment=SCM_WORKSPACE=/srv/mcp-workspace
+ExecStart=/opt/server-control-mcp/.venv/bin/server-control-mcp serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=server-control-mcp
+NoNewPrivileges=true
+PrivateTmp=true
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+state
+workspace
+__pycache__
+*.egg-info
+build
+dist
+.venv
+*.sqlite3*
+*.token
+*.pem
+*.key

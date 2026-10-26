@@ -1,0 +1,12 @@
+Coding Tools MCP
+Copyright 2026 Coding Tools MCP Contributors
+
+This product includes software and documentation developed for the
+Coding Tools MCP project.
+
+Source: https://github.com/xyTom/coding-tools-mcp
+
+Server Control MCP is an independent integration project.
+Gateway persistence and event adapters were extracted and generalized in 2026.
+The upstream executor is installed as an unmodified dependency, not vendored.
+PyJWT is an external MIT-licensed dependency.
