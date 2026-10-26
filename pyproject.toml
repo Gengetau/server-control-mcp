@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-dependencies = ["coding-tools-mcp==0.3.0", "PyJWT==2.15.1"]
+dependencies = ["coding-tools-mcp==0.5.0", "PyJWT==2.15.1"]
 
 [project.scripts]
 server-control-mcp = "server_control_mcp.cli:main"
