@@ -271,6 +271,200 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(self.req("/oauth/token",{"grant_type":"refresh_token",
             "client_id":client["client_id"],"refresh_token":tokens["refresh_token"]})[0],200)
 
+    GOOGLE_URIS=["https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-test",
+                 "https://oauth-redirect-sandbox.googleusercontent.com/r/user_bound_custom-mcp-test"]
+
+    def pkce(self):
+        verifier=secrets.token_urlsafe(48)
+        return verifier,base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    def test_http_resource_omitted_root_or_mcp_path_all_bind_to_origin(self):
+        self.start()
+        for variant in [None,"",ORIGIN,ORIGIN+"/",ORIGIN+"/mcp",ORIGIN+"/mcp/"]:
+            client=self.register("client_secret_post")
+            verifier,challenge=self.pkce()
+            args={"response_type":"code","client_id":client["client_id"],"redirect_uri":"http://127.0.0.1/callback",
+                  "code_challenge":challenge,"code_challenge_method":"S256","state":"s"}
+            if variant is not None:args["resource"]=variant
+            status,_,_,page=self.req("/oauth/authorize?"+urllib.parse.urlencode(args))
+            self.assertEqual(status,200,variant)
+            self.assertIn(("name='resource' value='"+ORIGIN+"'").encode(),page)
+            post={k:v for k,v in args.items() if k!="response_type"}
+            status,headers,_,_=self.req("/oauth/authorize",{**post,"password":PASSWORD})
+            self.assertEqual(status,302,variant)
+            code=urllib.parse.parse_qs(urllib.parse.urlsplit(headers["Location"]).query)["code"][0]
+            token={"grant_type":"authorization_code","client_id":client["client_id"],"client_secret":client["client_secret"],
+                   "code":code,"redirect_uri":"http://127.0.0.1/callback","code_verifier":verifier}
+            if variant is not None:token["resource"]=variant
+            status,_,tokens,_=self.req("/oauth/token",token)
+            self.assertEqual(status,200,variant)
+            self.assertIn("refresh_token",tokens)
+            self.assertEqual(p.decode_access(tokens["access_token"],self.cfg,ORIGIN)["aud"],ORIGIN)
+            self.assertEqual(self.req("/mcp",token=tokens["access_token"])[0],200)
+            refresh={"grant_type":"refresh_token","client_id":client["client_id"],
+                     "client_secret":client["client_secret"],"refresh_token":tokens["refresh_token"]}
+            if variant is not None:refresh["resource"]=variant
+            status,_,new,_=self.req("/oauth/token",refresh)
+            self.assertEqual(status,200,variant)
+            self.assertEqual(self.req("/mcp",token=new["access_token"])[0],200)
+
+    def test_http_foreign_resource_still_rejected(self):
+        self.start()
+        client=self.register()
+        verifier,challenge=self.pkce()
+        for bad in ["https://other.example","https://other.example/mcp",ORIGIN+"/other",ORIGIN+"/mcpx"]:
+            args={"response_type":"code","client_id":client["client_id"],"redirect_uri":"http://127.0.0.1/callback",
+                  "code_challenge":challenge,"code_challenge_method":"S256","resource":bad}
+            self.assertEqual(self.req("/oauth/authorize?"+urllib.parse.urlencode(args))[0],400,bad)
+            post={k:v for k,v in args.items() if k!="response_type"}
+            self.assertEqual(self.req("/oauth/authorize",{**post,"password":PASSWORD})[0],400,bad)
+        params=self.authorization(client)
+        status,_,body,_=self.req("/oauth/token",{**params,"resource":"https://other.example"})
+        self.assertEqual((status,body["error"]),(400,"invalid_target"))
+        status,_,body,_=self.req("/oauth/token",params)
+        self.assertEqual(status,200)
+
+    def test_http_confidential_client_may_use_post_or_basic_public_stays_strict(self):
+        self.start()
+        for registered,presented in [("client_secret_post","basic"),("client_secret_basic","post")]:
+            client=self.register(registered)
+            params=self.authorization(client)
+            wrong={**params,"client_secret":"wrong"} if presented=="post" else params
+            basic=(client["client_id"],"wrong") if presented=="basic" else None
+            self.assertEqual(self.req("/oauth/token",wrong,basic=basic)[2]["error"],"invalid_client")
+            params=self.authorization(client)
+            basic=(client["client_id"],client["client_secret"]) if presented=="basic" else None
+            if presented=="post":params["client_secret"]=client["client_secret"]
+            self.assertEqual(self.req("/oauth/token",params,basic=basic)[0],200,registered)
+        public=self.register("none")
+        params=self.authorization(public)
+        self.assertEqual(self.req("/oauth/token",params,basic=(public["client_id"],"x"))[2]["error"],"invalid_client")
+        self.assertEqual(self.req("/oauth/token",{**params,"client_secret":"x"})[2]["error"],"invalid_client")
+        self.assertEqual(self.req("/oauth/token",params)[0],200)
+
+    def test_google_lost_rotation_is_recovered_but_real_reuse_still_revokes(self):
+        google=self.cfg.registry.register({"redirect_uris":self.GOOGLE_URIS,"token_endpoint_auth_method":"client_secret_post",
+                                           "grant_types":["authorization_code","refresh_token"],"client_name":"Google"})
+        cid=google["client_id"]
+        self.assertTrue(p.google_redirect_client(self.cfg.registry,cid))
+        store=self.cfg.registry.store
+        family,t0=store.issue(cid,ORIGIN)
+        _,_,t1=store.rotate(t0,cid,allow_lost_rotation=True)
+        sid,_,t2=store.rotate(t0,cid,allow_lost_rotation=True)
+        self.assertEqual(sid,family)
+        self.assertTrue(store.active(family,cid,ORIGIN))
+        _,_,t3=store.rotate(t2,cid,allow_lost_rotation=True)
+        for old in (t0,t1):
+            with self.assertRaises(p.OAuthFault):store.rotate(old,cid,allow_lost_rotation=True)
+        self.assertFalse(store.active(family,cid,ORIGIN))
+        with self.assertRaises(p.OAuthFault):store.rotate(t3,cid,allow_lost_rotation=True)
+
+    def test_lost_rotation_recovery_only_for_google_redirect_clients(self):
+        self.start()
+        mixed=self.cfg.registry.register({"redirect_uris":[self.GOOGLE_URIS[0],"http://127.0.0.1/callback"],
+                                          "grant_types":["authorization_code","refresh_token"]})
+        self.assertFalse(p.google_redirect_client(self.cfg.registry,mixed["client_id"]))
+        spoof=self.cfg.registry.register({"redirect_uris":["https://evil.oauth-redirect-x.googleusercontent.com/r/x"],
+                                          "grant_types":["authorization_code","refresh_token"]})
+        self.assertFalse(p.google_redirect_client(self.cfg.registry,spoof["client_id"]))
+        client=self.register()
+        self.assertFalse(p.google_redirect_client(self.cfg.registry,client["client_id"]))
+        status,_,tokens,_=self.req("/oauth/token",self.authorization(client))
+        refresh={"grant_type":"refresh_token","client_id":client["client_id"],"refresh_token":tokens["refresh_token"]}
+        self.assertEqual(self.req("/oauth/token",refresh)[0],200)
+        status,_,body,_=self.req("/oauth/token",refresh)
+        self.assertEqual((status,body["error"]),(400,"invalid_grant"))
+        self.assertEqual(self.req("/mcp",token=tokens["access_token"])[0],401)
+
+    def test_http_path_aware_protected_resource_metadata(self):
+        self.start()
+        for path in ["/.well-known/oauth-protected-resource","/.well-known/oauth-protected-resource/mcp"]:
+            status,_,meta,_=self.req(path)
+            self.assertEqual(status,200,path)
+            self.assertEqual(meta["resource"],ORIGIN+"/mcp")
+            self.assertEqual(meta["authorization_servers"],[ORIGIN])
+            self.assertEqual(meta["scopes_supported"],["mcp"])
+        self.assertEqual(self.req("/.well-known/oauth-protected-resource/other")[0],404)
+        status,headers,_,_=self.req("/mcp")
+        self.assertEqual(status,401)
+        self.assertIn('resource_metadata="'+ORIGIN+'/.well-known/oauth-protected-resource/mcp"',
+                      headers["WWW-Authenticate"])
+
+    def _raw_http(self, raw_request: bytes) -> tuple[int, bytes]:
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port), timeout=3) as sock:
+            sock.sendall(raw_request)
+            chunks = []
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        resp = b"".join(chunks)
+        head, _, body = resp.partition(b"\r\n\r\n")
+        status = int(head.splitlines()[0].split()[1])
+        return status, body
+
+    @staticmethod
+    def _chunk_encode(parts: list[bytes], trailer: bytes = b"") -> bytes:
+        out = bytearray()
+        for part in parts:
+            out.extend(f"{len(part):x}\r\n".encode("ascii"))
+            out.extend(part)
+            out.extend(b"\r\n")
+        out.extend(b"0\r\n")
+        out.extend(trailer)
+        out.extend(b"\r\n")
+        return bytes(out)
+
+    def test_http_chunked_mcp_post_and_legacy_protocol_header(self):
+        self.start()
+        client = self.register()
+        _, _, tokens, _ = self.req("/oauth/token", self.authorization(client))
+        token = tokens["access_token"]
+        rpc = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "gemini", "version": "1"}
+        }}).encode("utf-8")
+        chunked = self._chunk_encode([rpc[:19], rpc[19:55], rpc[55:]])
+        for ver in ("2025-06-18", "2025-03-26", "2024-11-05"):
+            raw = (
+                f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                f"Authorization: Bearer {token}\r\nContent-Type: application/json\r\n"
+                f"MCP-Protocol-Version: {ver}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ).encode("ascii") + chunked
+            status, body = self._raw_http(raw)
+            self.assertEqual(status, 200, ver)
+            self.assertEqual(json.loads(body)["id"], 7)
+
+    def test_http_chunked_smuggling_unauth_and_size_guards(self):
+        self.start()
+        client = self.register()
+        _, _, tokens, _ = self.req("/oauth/token", self.authorization(client))
+        token = tokens["access_token"]
+        unauth = (
+            f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+            f"Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        ).encode("ascii")
+        self.assertEqual(self._raw_http(unauth)[0], 401)
+        conflict = (
+            f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+            f"Authorization: Bearer {token}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n"
+        ).encode("ascii")
+        self.assertEqual(self._raw_http(conflict)[0], 400)
+        oversized = (
+            f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+            f"Authorization: Bearer {token}\r\nContent-Type: application/json\r\n"
+            f"Transfer-Encoding: chunked\r\n\r\n200000\r\n"
+        ).encode("ascii")
+        self.assertEqual(self._raw_http(oversized)[0], 413)
+        gzip_te = (
+            f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+            f"Authorization: Bearer {token}\r\nContent-Type: application/json\r\n"
+            f"Transfer-Encoding: gzip\r\n\r\n"
+        ).encode("ascii")
+        self.assertEqual(self._raw_http(gzip_te)[0], 501)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

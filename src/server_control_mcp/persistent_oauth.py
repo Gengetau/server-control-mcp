@@ -7,11 +7,14 @@ import base64
 from collections.abc import MutableMapping
 from contextlib import contextmanager
 from dataclasses import asdict
+import fnmatch
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import secrets
 import sqlite3
@@ -22,6 +25,87 @@ from coding_tools_mcp import oauth
 from coding_tools_mcp import server as upstream
 
 REFRESH_TTL = 90 * 86400
+PRM_PATH = "/.well-known/oauth-protected-resource"
+LEGACY_MCP_HEADER_ALIASES = frozenset({"2025-03-26", "2024-11-05"})
+OAUTH_POST_PATHS = frozenset({"/oauth/authorize", "/oauth/token", "/oauth/register", "/oauth/revoke"})
+# Google account linking (Gemini Connected Apps) does not always persist a
+# rotated refresh token. Only clients whose redirect URIs are all Google's
+# HTTPS OAuth redirect hosts get lost-rotation recovery (see OAuthStore.rotate).
+GOOGLE_REDIRECT_PATTERNS = ("oauth-redirect.googleusercontent.com",
+                            "oauth-redirect-*.googleusercontent.com")
+
+class ChunkedEncodingError(Exception):
+    pass
+
+class ChunkedBodyTooLarge(Exception):
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+
+def read_chunked_body(rfile, max_bytes: int) -> bytes:
+    """Decode an HTTP/1.1 chunked request body (RFC 9112 section 7.1) with strict bounds."""
+    out = bytearray()
+    while True:
+        line = rfile.readline(4098)
+        if not line or len(line) > 4096 or not line.endswith(b"\r\n"):
+            raise ChunkedEncodingError("Malformed chunk size line")
+        size_part = line[:-2].split(b";", 1)[0].strip()
+        if not size_part or not re.fullmatch(rb"[0-9A-Fa-f]{1,8}", size_part):
+            raise ChunkedEncodingError("Invalid chunk size")
+        chunk_size = int(size_part, 16)
+        if chunk_size == 0:
+            for _ in range(64):
+                trailer = rfile.readline(4098)
+                if not trailer or len(trailer) > 4096 or not trailer.endswith(b"\r\n"):
+                    raise ChunkedEncodingError("Malformed chunk trailer")
+                if trailer == b"\r\n":
+                    return bytes(out)
+            raise ChunkedEncodingError("Too many chunk trailer lines")
+        if len(out) + chunk_size > max_bytes:
+            raise ChunkedBodyTooLarge(max_bytes)
+        chunk = rfile.read(chunk_size)
+        if len(chunk) != chunk_size:
+            raise ChunkedEncodingError("Truncated chunk payload")
+        if rfile.read(2) != b"\r\n":
+            raise ChunkedEncodingError("Missing chunk CRLF terminator")
+        out.extend(chunk)
+
+def canonical_resource(value, origin):
+    """RFC 8707 resource is optional; this gateway protects one MCP resource.
+    Accept omitted, the origin, or origin + /mcp; anything else is rejected."""
+    norm = (value or "").rstrip("/")
+    if norm in ("", origin, origin + upstream.MCP_ENDPOINT_PATH):
+        return origin
+    return None
+
+def _google_redirect_uri(uri: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(uri)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or port not in (None, 443) or not host:
+        return False
+    return any(
+        fnmatch.fnmatchcase(host, pat) and host.count(".") == pat.count(".")
+        for pat in GOOGLE_REDIRECT_PATTERNS
+    )
+
+def google_redirect_client(registry, client_id) -> bool:
+    client = registry.get(client_id)
+    uris = tuple(getattr(client, "redirect_uris", ()) or ())
+    return bool(uris) and all(isinstance(u, str) and _google_redirect_uri(u) for u in uris)
+
+def client_authenticates(registry, client_id, secret, method):
+    if registry.authenticates(client_id, secret, method):
+        return True
+    # Confidential clients may present their secret by post or basic,
+    # whichever they registered (RFC 6749 2.3.1); public clients stay strict.
+    confidential = {"client_secret_post", "client_secret_basic"}
+    client = registry.get(client_id)
+    return bool(client and secret and method in confidential
+                and client.token_endpoint_auth_method in confidential
+                and client.verifies_secret(secret))
 
 class OAuthFault(Exception):
     def __init__(self, error, description):
@@ -101,11 +185,11 @@ class OAuthStore:
     def digest(raw):
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def rotate(self, raw, client, resource=None):
+    def rotate(self, raw, client, resource=None, *, allow_lost_rotation=False):
         error = None
         new = "rt_" + secrets.token_urlsafe(48)
         with self.transaction() as db:
-            row = db.execute("""SELECT r.*,f.client,f.resource,f.revoked FROM refresh r
+            row = db.execute("""SELECT r.rowid AS rid,r.*,f.client,f.resource,f.revoked FROM refresh r
                 JOIN families f ON f.id=r.family WHERE r.digest=?""", (self.digest(raw),)).fetchone()
             if row is None or row["client"] != client:
                 error = OAuthFault("invalid_grant", "Invalid refresh token")
@@ -113,11 +197,20 @@ class OAuthStore:
                 error = OAuthFault("invalid_target", "Resource mismatch")
             elif row["revoked"] or row["expires"] <= time.time():
                 error = OAuthFault("invalid_grant", "Refresh grant expired or revoked")
-            elif row["used"]:
+            elif row["used"] and not (allow_lost_rotation and not db.execute(
+                    "SELECT 1 FROM refresh WHERE family=? AND rowid>? AND used=1 LIMIT 1",
+                    (row["family"], row["rid"])).fetchone()):
                 db.execute("UPDATE families SET revoked=1 WHERE id=?", (row["family"],))
                 error = OAuthFault("invalid_grant", "Refresh token reuse detected; grant revoked")
             else:
-                db.execute("UPDATE refresh SET used=1 WHERE digest=?", (self.digest(raw),))
+                if row["used"]:
+                    # Lost rotation: no newer token of this family was ever
+                    # presented, so the client never received it. Retire
+                    # those unseen successors and continue the family.
+                    db.execute("UPDATE refresh SET used=1 WHERE family=? AND rowid>?",
+                               (row["family"], row["rid"]))
+                else:
+                    db.execute("UPDATE refresh SET used=1 WHERE digest=?", (self.digest(raw),))
                 db.execute("INSERT INTO refresh VALUES(?,?,?,0)",
                            (self.digest(new), row["family"], time.time()+REFRESH_TTL))
                 family, bound_resource = row["family"], row["resource"]
@@ -236,6 +329,49 @@ class PersistentOAuthMixin:
         header = self.headers.get("Authorization", "").strip()
         return bool(cfg and header.startswith("Bearer ") and valid_access(header[7:], cfg, self.oauth_base_url()))
 
+    # RFC 9728 path-aware protected resource metadata. Clients such as Gemini
+    # custom apps compare the metadata "resource" with the configured MCP URL
+    # (origin + /mcp). Both metadata URLs describe the /mcp endpoint; tokens
+    # stay bound to the origin internally (canonical_resource).
+    def mcp_resource_url(self):
+        return self.oauth_base_url() + upstream.MCP_ENDPOINT_PATH
+
+    def handle_oauth_resource_metadata(self, *, head_only=False):
+        if self.runtime.oauth_config is None:
+            return super().handle_oauth_resource_metadata(head_only=head_only)
+        self.send_json({"resource":self.mcp_resource_url(),
+                        "authorization_servers":[self.oauth_base_url()],
+                        "bearer_methods_supported":["header"],
+                        "scopes_supported":["mcp"]}, head_only=head_only)
+
+    def handle_metadata_request(self, *, head_only):
+        normalized = posixpath.normpath(self.path.split("?", 1)[0])
+        if normalized == PRM_PATH + upstream.MCP_ENDPOINT_PATH:
+            return self.handle_oauth_resource_metadata(head_only=head_only)
+        return super().handle_metadata_request(head_only=head_only)
+
+    def do_OPTIONS(self):
+        normalized = posixpath.normpath(self.path.split("?", 1)[0])
+        if normalized in {PRM_PATH + upstream.MCP_ENDPOINT_PATH, "/oauth/revoke"}:
+            origin = self.headers.get("Origin")
+            if origin and not upstream.is_allowed_origin(origin):
+                return self.send_json({"error": "Origin denied"}, status=403)
+            self.send_response(204)
+            self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
+            self.send_cors_headers()
+            self.end_headers()
+            return
+        return super().do_OPTIONS()
+
+    def send_unauthorized(self, *, head_only=False):
+        if self.runtime.oauth_config is None:
+            return super().send_unauthorized(head_only=head_only)
+        base = self.oauth_base_url()
+        www_auth = (f'Bearer realm="coding-tools-mcp", resource_metadata='
+                    f'"{base}{PRM_PATH}{upstream.MCP_ENDPOINT_PATH}", scope="mcp"')
+        self.send_rpc_error(-32000, "Unauthorized", status=401,
+                            extra_headers={"WWW-Authenticate": www_auth}, head_only=head_only)
+
     def handle_oauth_as_metadata(self, *, head_only=False):
         base = self.oauth_base_url()
         self.send_json({"issuer":base,"authorization_endpoint":base+"/oauth/authorize",
@@ -281,9 +417,53 @@ class PersistentOAuthMixin:
                 cid, secret, method = basic_id, basic_secret, "client_secret_basic"
             except (ValueError, UnicodeError):
                 raise OAuthFault("invalid_client", "Invalid client authentication")
-        if not self.runtime.oauth_config.registry.authenticates(cid, secret, method):
+        if not client_authenticates(self.runtime.oauth_config.registry, cid, secret, method):
             raise OAuthFault("invalid_client", "Invalid client authentication")
         return cid
+
+    def _canonical_resource_pairs(self, pairs):
+        """Rewrite the first resource value (the one upstream reads) to the
+        canonical origin when it names this server or is omitted."""
+        origin, out, seen = self.oauth_base_url(), [], False
+        for key, value in pairs:
+            if key == "resource" and not seen:
+                seen = True
+                value = canonical_resource(value, origin) or value
+            out.append((key, value))
+        if not seen:
+            out.append(("resource", origin))
+        return out
+
+    def handle_oauth_authorize_get(self):
+        if self.runtime.oauth_config is not None:
+            parts = urllib.parse.urlsplit(self.path)
+            try:
+                pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True, max_num_fields=64)
+                self.path = urllib.parse.urlunsplit(("", "", parts.path,
+                    urllib.parse.urlencode(self._canonical_resource_pairs(pairs)), ""))
+            except ValueError:
+                pass
+        return super().handle_oauth_authorize_get()
+
+    def handle_oauth_authorize_post(self):
+        if self.runtime.oauth_config is None:
+            return super().handle_oauth_authorize_post()
+        body = self._read_oauth_body()
+        if body is None:
+            return None
+        if self.headers.get_content_type().lower() == "application/x-www-form-urlencoded":
+            try:
+                pairs = urllib.parse.parse_qsl(body.decode("utf-8"), keep_blank_values=True, max_num_fields=64)
+                body = urllib.parse.urlencode(self._canonical_resource_pairs(pairs)).encode()
+            except (UnicodeError, ValueError):
+                pass
+        original = self.rfile
+        self.rfile = io.BytesIO(body)
+        self.headers.replace_header("Content-Length", str(len(body)))
+        try:
+            return super().handle_oauth_authorize_post()
+        finally:
+            self.rfile = original
 
     def handle_oauth_token(self):
         try:
@@ -293,7 +473,10 @@ class PersistentOAuthMixin:
             cfg = self.runtime.oauth_config
             client = self._client(params)
             origin = self.oauth_base_url()
-            resource = params.get("resource", "").rstrip("/")
+            presented = params.get("resource", "")
+            resource = canonical_resource(presented, origin)
+            if resource is None:
+                raise OAuthFault("invalid_target", "Resource mismatch")
             scope = params.get("scope")
             if scope is not None and scope != "mcp":
                 raise OAuthFault("invalid_scope", "Only the consented mcp scope is supported")
@@ -302,7 +485,9 @@ class PersistentOAuthMixin:
                 raw = params.get("refresh_token", "")
                 if not raw:
                     raise OAuthFault("invalid_grant", "Refresh token is required")
-                family, resource, raw = cfg.registry.store.rotate(raw, client, resource or None)
+                family, resource, raw = cfg.registry.store.rotate(
+                    raw, client, resource if presented else None,
+                    allow_lost_rotation=google_redirect_client(cfg.registry, client))
             elif grant == "authorization_code":
                 verifier = params.get("code_verifier", "")
                 if not re.fullmatch(r"[A-Za-z0-9\-._~]{43,128}", verifier):
@@ -326,28 +511,86 @@ class PersistentOAuthMixin:
         except sqlite3.Error:
             self.send_json({"error":"temporarily_unavailable"}, status=503)
 
-    def do_POST(self):
-        if urllib.parse.urlsplit(self.path).path != "/oauth/revoke":
-            return super().do_POST()
-        try:
-            params = self._token_params()
-            if params is None:
-                return
-            client = self._client(params)
-            raw = params.get("token", "")
-            cfg = self.runtime.oauth_config
-            family = None
-            if not raw.startswith("rt_") and raw:
-                try:
-                    claims = decode_access(raw, cfg, self.oauth_base_url(), verify_exp=False)
-                    if claims.get("client_id") == client:
-                        family = claims.get("sid")
-                except jwt.PyJWTError:
-                    pass
-            cfg.registry.store.revoke(raw, client, family)
-            self.send_json({})
-        except OAuthFault as error:
-            self.send_json({"error":error.error,"error_description":error.description}, status=400)
-        except sqlite3.Error:
-            self.send_json({"error":"temporarily_unavailable"}, status=503)
+    def _dispatch_post_inner(self, normalized: str):
+        if normalized == "/oauth/revoke":
+            try:
+                params = self._token_params()
+                if params is None:
+                    return
+                client = self._client(params)
+                raw = params.get("token", "")
+                cfg = self.runtime.oauth_config
+                family = None
+                if not raw.startswith("rt_") and raw:
+                    try:
+                        claims = decode_access(raw, cfg, self.oauth_base_url(), verify_exp=False)
+                        if claims.get("client_id") == client:
+                            family = claims.get("sid")
+                    except jwt.PyJWTError:
+                        pass
+                cfg.registry.store.revoke(raw, client, family)
+                self.send_json({})
+            except OAuthFault as error:
+                self.send_json({"error":error.error,"error_description":error.description}, status=400)
+            except sqlite3.Error:
+                self.send_json({"error":"temporarily_unavailable"}, status=503)
+            return
+        return super().do_POST()
 
+    def do_POST(self):
+        normalized = posixpath.normpath(self.path.split("?", 1)[0])
+        is_mcp = normalized == upstream.MCP_ENDPOINT_PATH
+        if is_mcp:
+            versions = self.headers.get_all("MCP-Protocol-Version") or []
+            if len(versions) == 1 and versions[0].strip() in LEGACY_MCP_HEADER_ALIASES:
+                self.headers.replace_header("MCP-Protocol-Version", "2025-06-18")
+
+        te_values = self.headers.get_all("Transfer-Encoding")
+        if not te_values:
+            return self._dispatch_post_inner(normalized)
+
+        is_oauth = normalized in OAUTH_POST_PATHS
+        def reject(status: int, message: str, *, data=None):
+            self.close_connection = True
+            if is_mcp:
+                self.send_rpc_error(-32600, message, status=status, data=data)
+            else:
+                self.send_json({"error": "invalid_request", "error_description": message}, status=status)
+
+        if self.headers.get("Content-Length") is not None:
+            return reject(400, "Conflicting Transfer-Encoding and Content-Length")
+        codings = [t.strip().lower() for v in te_values for t in v.split(",") if t.strip()]
+        if codings != ["chunked"]:
+            return reject(501, "Unsupported Transfer-Encoding")
+        if not is_mcp and not is_oauth:
+            self.close_connection = True
+            return self.send_rpc_error(-32601, "Unknown endpoint", status=404)
+        if is_mcp:
+            origin = self.headers.get("Origin")
+            if origin and not upstream.is_allowed_origin(origin):
+                self.close_connection = True
+                return self.send_rpc_error(-32600, "Origin denied", status=403)
+            if not self.is_authorized():
+                self.close_connection = True
+                return self.send_unauthorized()
+            if self.headers.get_content_type().lower() != "application/json":
+                self.close_connection = True
+                return self.send_rpc_error(-32600, "Content-Type must be application/json", status=415)
+
+        max_bytes = upstream.MAX_HTTP_REQUEST_BYTES if is_mcp else oauth.OAUTH_MAX_BODY_BYTES
+        try:
+            body = read_chunked_body(self.rfile, max_bytes)
+        except ChunkedBodyTooLarge:
+            return reject(413, "Request body exceeds maximum size", data={"max_bytes": max_bytes})
+        except ChunkedEncodingError as exc:
+            return reject(400, str(exc))
+
+        del self.headers["Transfer-Encoding"]
+        del self.headers["Content-Length"]
+        self.headers["Content-Length"] = str(len(body))
+        original = self.rfile
+        self.rfile = io.BytesIO(body)
+        try:
+            return self._dispatch_post_inner(normalized)
+        finally:
+            self.rfile = original
