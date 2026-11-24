@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Documented `CODING_TOOLS_MCP_ALLOWED_ORIGINS` and verified ChatGPT custom MCP connections (origin `https://chatgpt.com`, redirect host `chatgpt.com`) alongside Claude and Gemini.
 - Added RFC 9728 path-aware protected resource metadata (`/.well-known/oauth-protected-resource/mcp`) and `scope="mcp"` advertisement in `WWW-Authenticate` for Gemini Connected Apps compatibility.
 - Accepted omitted, origin, or `origin + "/mcp"` `resource` parameters across `/oauth/authorize` and `/oauth/token` while keeping JWT audiences bound to the origin.
 - Allowed confidential OAuth clients to authenticate via either `client_secret_post` or `client_secret_basic` (RFC 6749 section 2.3.1), while keeping public PKCE clients strict.

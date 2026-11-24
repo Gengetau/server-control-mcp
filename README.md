@@ -84,6 +84,15 @@ https://mcp.example.com/mcp
 使用生成配置里的专用密码登录。支持动态注册的客户端通常不需要预填 Client ID / Secret。
 客户端是否支持令牌刷新、实验性 Events，取决于客户端自身；本版本没有逐个平台重新验收。
 
+已在实际部署中验证可接入：Claude 自定义连接器、Google Gemini Connected Apps、ChatGPT 自定义 MCP（2026-11-24）。
+浏览器端会发送 `Origin` 头的客户端，需要把它的来源加入 `CODING_TOOLS_MCP_ALLOWED_ORIGINS`（逗号分隔），例如：
+
+```text
+CODING_TOOLS_MCP_ALLOWED_ORIGINS=https://claude.ai,https://gemini.google.com,https://chatgpt.com
+```
+
+如果在网关前另加了按回调域名限制动态注册的加固层，ChatGPT 的回调域名是 `chatgpt.com`，需要一并放行，否则注册会被拒绝。
+
 ## 配置
 
 `init` 生成的 `.env` 包含以下键（完整说明见 [部署说明](docs/deployment.md)）：
@@ -97,6 +106,7 @@ https://mcp.example.com/mcp
 | `SCM_BACKEND_PORT` / `SCM_GATEWAY_PORT` | 28766 / 28767，仅绑定 127.0.0.1 |
 | `SCM_PERMISSION_MODE` | `safe`（默认）/ `trusted` / `dangerous` |
 | `SCM_EVENTS_ENABLED` | `0`（默认）/ `1` |
+| `CODING_TOOLS_MCP_ALLOWED_ORIGINS` | 可选，允许的浏览器来源，逗号分隔（本机地址始终允许） |
 
 ## 权限模式
 

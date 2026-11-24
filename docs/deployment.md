@@ -17,6 +17,7 @@
 | SCM_BACKEND_PORT / SCM_GATEWAY_PORT | 28766 / 28767，仅 127.0.0.1 |
 | SCM_PERMISSION_MODE | safe / trusted / dangerous，默认 safe |
 | SCM_EVENTS_ENABLED | 0 / 1，默认 0 |
+| CODING_TOOLS_MCP_ALLOWED_ORIGINS | 可选，浏览器来源白名单，逗号分隔；接入 ChatGPT 需包含 https://chatgpt.com |
 
 原始上游 `CODING_TOOLS_MCP_*` 执行策略覆盖项不会继承到执行进程；通过本表设置模式。
 为避免密钥继承，网关的 OAuth 配置也不会进入执行进程。

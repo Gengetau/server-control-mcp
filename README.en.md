@@ -88,6 +88,18 @@ Sign in with the generated operator password. Clients supporting dynamic registr
 normally need no pre-filled Client ID / Secret. Token refresh and experimental Events
 support depend on the client; this release has not been re-validated per platform.
 
+Verified against a live deployment: Claude custom connectors, Google Gemini Connected Apps,
+and ChatGPT custom MCP (2026-11-24). Clients that send a browser `Origin` header must be
+listed in `CODING_TOOLS_MCP_ALLOWED_ORIGINS` (comma-separated), for example:
+
+```text
+CODING_TOOLS_MCP_ALLOWED_ORIGINS=https://claude.ai,https://gemini.google.com,https://chatgpt.com
+```
+
+If you put an extra hardening layer in front of the gateway that restricts dynamic
+registration by redirect host, ChatGPT's redirect host is `chatgpt.com`; allow it or
+registration will be rejected.
+
 ## Configuration
 
 Keys written by `init` (full reference in [deployment](docs/deployment.md)):
@@ -101,6 +113,7 @@ Keys written by `init` (full reference in [deployment](docs/deployment.md)):
 | `SCM_BACKEND_PORT` / `SCM_GATEWAY_PORT` | 28766 / 28767, bound to 127.0.0.1 only |
 | `SCM_PERMISSION_MODE` | `safe` (default) / `trusted` / `dangerous` |
 | `SCM_EVENTS_ENABLED` | `0` (default) / `1` |
+| `CODING_TOOLS_MCP_ALLOWED_ORIGINS` | Optional, allowed browser origins, comma-separated (loopback always allowed) |
 
 ## Permission modes
 
